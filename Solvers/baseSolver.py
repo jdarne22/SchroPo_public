@@ -19,7 +19,7 @@ class Solver():
 
 	def __init__(self, simName = None, N = None, np = None, mp = None, data_drops = None,
 		padded = False, cf = None, L = None, dx = None, nf = None,
-		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = False):
+		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = False, a_stars = None):
 		"""
 		initialize solver object
 
@@ -40,6 +40,7 @@ class Solver():
 		:v: array-like, [np, D] particle velocities
 		:dt: float, initial timestep
 		:gpu: bool, run on the gpu
+		:a_stars: float, Plummer scale length for stars
 
 		:return: solver object
 		"""
@@ -69,6 +70,7 @@ class Solver():
 		self.D = D # int, number of spatial dimensions
 		self.C = C # float, poisson's constant
 		self.Tf = Tf # float, final time
+		self.a_stars = a_stars # float, Plummer scale length for stars
 
 		### external potentials 
 		### WARNING: you should only pick one way to define these 
@@ -94,7 +96,7 @@ class Solver():
 
 	def SetParams(self, simName = None, N = None, np = None, mp = None, data_drops = None,
 		padded = None, cf = None, L = None, dx = None, nf = None,
-		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = None):
+		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = None, a_stars = None):
 		"""
 		sets parameters
 
@@ -115,6 +117,7 @@ class Solver():
 		:v: array-like, [np, D] particle velocities
 		:dt: float, initial timestep
 		:gpu: bool, run on the gpu
+		:a_stars: float, Plummer scale length for stars
 		"""
 		if gpu != None:
 			self.set_gpu(gpu)
@@ -148,6 +151,8 @@ class Solver():
 			self.set_r(r)
 		if len(v) > 0:
 			self.set_v(v)
+		if a_stars != None:
+			self.a_stars = a_stars
 
 		if N != None:
 			self.set_N_perif()
@@ -465,7 +470,17 @@ class Solver():
 		if self.v_max_part_artificial > 0 and self.v_max_part_artificial < max_v:
 			max_v = self.v_max_part_artificial
 
-		dt_all[0] = self.cf * self.dx / max_v
+		# bound stars cannot outrun the central (maximum) Plummer escape speed,
+		# so cap max_v with it and keep an unphysically fast particle from
+		# collapsing the timestep
+		if self.a_stars != None and self.ParticlesHaveMass():
+			v_esc = np.sqrt(2 * au.G * np.sum(self.mp) / self.a_stars)
+			max_v = np.minimum(max_v, v_esc)
+
+		if self.eps != 0:
+			dt_all[0] = self.eps / max_v
+		else:
+			dt_all[0] = self.cf * self.dx / max_v
 		dt_all[1] = T_remaining
 		dt_all[2] = self.dt_max
 
@@ -914,20 +929,25 @@ class Solver():
 		if CUPY_IMPORTED and self.gpu:
 			np = cp
 
-		acc = np.zeros(r.shape)  
-		ijk = np.floor((r + L/2.) / dx).astype(int) # [n_particles, [i,j,k]]\
+		acc = np.zeros(r.shape)
+		# cell centres sit at half-integer positions, so the centre to the
+		# particle's left is floor(u) with u shifted by .5 -- not floor((r+L/2)/dx),
+		# which gives the cell that *contains* the particle instead.
+		u = (r + L/2.) / dx - .5
+		ijk = np.floor(u).astype(int) # [n_particles, [i,j,k]]
+		# in-cell offset in [0,1), taken BEFORE the wrap: re-deriving it from a
+		# wrapped index would put the reference centre a whole box away.
+		t = u - ijk
 		ijk %= N
 
-		x = dx*(.5+np.arange(-1*N//2, N//2))
-
 		for i in range(self.D):
-			axis_ = i 
+			axis_ = i
 			gradPhi = mu.gradient_1D(phi, dx, axis_, gpu = self.gpu, padded= self.padded)
 
 			# i,j,k
-			f1 = 1 - np.abs(x[ijk[:,0]] - r[:,0])/dx
-			f2 = 1 - np.abs(x[ijk[:,1]] - r[:,1])/dx
-			f3 = 1 - np.abs(x[ijk[:,2]] - r[:,2])/dx
+			f1 = 1 - t[:,0]
+			f2 = 1 - t[:,1]
+			f3 = 1 - t[:,2]
 			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
 
 			# i+1,j,k
@@ -1002,19 +1022,21 @@ class Solver():
 		if CUPY_IMPORTED and self.gpu:
 			np = cp
 
-		acc = np.zeros(r.shape)  
-		ijk = np.floor((r + L/2.) / dx).astype(int) # [n_particles, [i,j,k]]\
+		acc = np.zeros(r.shape)
+		# see ComputeAcc3D: anchor on the cell centre to the particle's left,
+		# and take the offset before wrapping the index
+		u = (r + L/2.) / dx - .5
+		ijk = np.floor(u).astype(int) # [n_particles, [i,j]]
+		t = u - ijk
 		ijk %= N
 
-		x = dx*(.5+np.arange(-1*N//2, N//2))
-
 		for i in range(self.D):
-			axis_ = i 
+			axis_ = i
 			gradPhi = mu.gradient_1D(phi, dx, axis_, gpu = self.gpu, padded=self.padded)
 
 			# i,j
-			f1 = 1 - np.abs(x[ijk[:,0]] - r[:,0])/dx
-			f2 = 1 - np.abs(x[ijk[:,1]] - r[:,1])/dx
+			f1 = 1 - t[:,0]
+			f2 = 1 - t[:,1]
 			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1]]*f1*f2
 
 			# i+1,j
@@ -1058,17 +1080,19 @@ class Solver():
 		if CUPY_IMPORTED and self.gpu:
 			np = cp
 
-		acc = np.zeros(r.shape)  
-		ijk = np.floor((r + L/2.) / dx).astype(int) # [n_particles, [i,j,k]]\
+		acc = np.zeros(r.shape)
+		# see ComputeAcc3D: anchor on the cell centre to the particle's left,
+		# and take the offset before wrapping the index
+		u = (r + L/2.) / dx - .5
+		ijk = np.floor(u).astype(int) # [n_particles, [i]]
+		t = u - ijk
 		ijk %= N
 
-		x = dx*(.5+np.arange(-1*N//2, N//2))
-
-		axis_ = 0 
+		axis_ = 0
 		gradPhi = mu.gradient_1D(phi, dx, axis_, gpu = self.gpu, padded=self.padded)
 
 		# i
-		f1 = 1 - np.abs(x[ijk[:]] - r[:])/dx
+		f1 = 1 - t[:]
 		acc[:] += gradPhi[ijk[:]]*f1
 
 		# i+1
@@ -1115,19 +1139,20 @@ class Solver():
 			mp = np.ones(self.np)*self.mp
 
 		rho_r = np.zeros((len_))
-		ijk = np.floor((r + L/2.) / dx).astype(int) # [n_particles, [i,j,k]]\
+		# cell centres sit at half-integer positions, so the centre to the
+		# particle's left is floor(u) with u shifted by .5 -- not floor((r+L/2)/dx),
+		# which gives the cell that *contains* the particle instead.
+		u = (r + L/2.) / dx - .5
+		ijk = np.floor(u).astype(int) # [n_particles, [i,j,k]]
+		# in-cell offset in [0,1), taken BEFORE the wrap: re-deriving it from a
+		# wrapped index would put the reference centre a whole box away.
+		t = u - ijk
 		ijk %= N
-		# print(np.min(rho_r), np.max(rho_r))
-
-
-		x = dx*(.5+np.arange(-1*N//2, N//2))
 
 		# i,j,k
-		f1 = 1 - np.abs(x[ijk[:,0]] - r[:,0])/dx
-		f2 = 1 - np.abs(x[ijk[:,1]] - r[:,1])/dx
-		f3 = 1 - np.abs(x[ijk[:,2]] - r[:,2])/dx
-		# f2 = (x[ijk[:,1]] - r[:,1])/dx + 1. # ty
-		# f3 = (x[ijk[:,2]] - r[:,2])/dx + 1. # ty
+		f1 = 1 - t[:,0]
+		f2 = 1 - t[:,1]
+		f3 = 1 - t[:,2]
 		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
 		rho_ = np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
 		# print(np.min(rho_), np.max(rho_))
@@ -1210,14 +1235,16 @@ class Solver():
 			mp = np.ones(self.np)*self.mp
 
 		rho_r = np.zeros((len_))
-		ijk = np.floor((r + L/2.) / dx).astype(int) # [n_particles, [i,j,k]]\
+		# see ComputeParticleDensity3D: anchor on the cell centre to the
+		# particle's left, and take the offset before wrapping the index
+		u = (r + L/2.) / dx - .5
+		ijk = np.floor(u).astype(int) # [n_particles, [i,j]]
+		t = u - ijk
 		ijk %= N
 
-		x = dx*(.5+np.arange(-1*N//2, N//2))
-
 		# i,j
-		f1 = 1 - np.abs(x[ijk[:,0]] - r[:,0])/dx
-		f2 = 1 - np.abs(x[ijk[:,1]] - r[:,1])/dx
+		f1 = 1 - t[:,0]
+		f2 = 1 - t[:,1]
 		ind_ = ijk[:,0]*N + ijk[:,1]
 		rho_r += np.bincount(ind_, weights = f1*f2*mp, minlength = len_)
 
@@ -1268,13 +1295,15 @@ class Solver():
 			mp = np.ones(self.np)*self.mp
 
 		rho_r = np.zeros((len_))
-		ijk = np.floor((r + L/2.) / dx).astype(int) # [n_particles, [i,j,k]]\
+		# see ComputeParticleDensity3D: anchor on the cell centre to the
+		# particle's left, and take the offset before wrapping the index
+		u = (r + L/2.) / dx - .5
+		ijk = np.floor(u).astype(int) # [n_particles, [i]]
+		t = u - ijk
 		ijk %= N
 
-		x = dx*(.5+np.arange(-1*N//2, N//2))
-
 		# i
-		f1 = 1 - np.abs(x[ijk[:]] - r[:])/dx
+		f1 = 1 - t[:]
 		ind_ = ijk[:]
 		rho_r += np.bincount(ind_, weights = f1*mp, minlength = len_)
 
