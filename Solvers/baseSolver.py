@@ -877,7 +877,7 @@ class Solver():
 				    r_vecs[r_vecs > self.L/2.] -= self.L
 				    r_vecs[r_vecs < -1*self.L/2.] += self.L
 
-				R = mu.Norm_L2(r_vecs, axes = (1)) + self.eps 
+				R = np.sqrt(mu.Norm_L2(r_vecs, axes = (1))**2 + self.eps**2 )
 				acc[i] = self.C*np.sum(mp_[:,np.newaxis]*r_vecs / R[:,np.newaxis]**3, axis = 0) / (4*np.pi)
 			
 			if self.D == 2:
@@ -885,7 +885,7 @@ class Solver():
 				if self.mod_positions:
 				    r_vecs[r_vecs > self.L/2.] -= self.L
 				    r_vecs[r_vecs < -1*self.L/2.] += self.L
-				R = mu.Norm_L2(r_vecs, axes = (1))  + self.eps
+				R = np.sqrt(mu.Norm_L2(r_vecs, axes = (1))**2 + self.eps**2 )
 				acc[i] = 2*self.C*np.sum(mp_[:,np.newaxis]*r_vecs / R[:,np.newaxis]**2, axis = 0) / (4*np.pi)
 			
 			if self.D == 1:
