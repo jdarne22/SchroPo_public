@@ -78,6 +78,7 @@ class Solver():
 		self.make_periodic = True # should the walls of the box identify
 		self.mod_positions = False # when performing explicit force calc should particles be centered in box?
 		self.v_max_part_artificial = -1
+		self.dataDir = "Data/"
 
 		### physics parameter
 		self.L = L # float, box length
@@ -433,8 +434,8 @@ class Solver():
 			raise Exception("simName has not been set.\n"+\
 				"set simName before initializing files.")
 
-		if not(os.path.isdir(f"Data/{self.simName}")):
-			os.mkdir(f"Data/{self.simName}")
+		if not(os.path.isdir(self.dataDir + f"{self.simName}")):
+			os.mkdir(self.dataDir + f"{self.simName}")
 		self.OutputToml()
 		self.OutputICs()
 
@@ -469,7 +470,7 @@ class Solver():
 		fd_order 					= {self.fd_order} # int, central-difference order for grad(phi)
 		'''
 
-		f = open(f"Data/{self.simName}/meta.toml", "w")
+		f = open(self.dataDir + f"{self.simName}/meta.toml", "w")
 		f.write(text)
 		f.close()
 
@@ -483,7 +484,7 @@ class Solver():
 		"""
 		returns the name of the tomlFile
 		"""
-		return f"Data/{self.simName}/meta.toml"
+		return self.dataDir + f"{self.simName}/meta.toml"
 
 
 
@@ -491,10 +492,10 @@ class Solver():
 		"""
 		outputs the initial conditions
 		"""
-		if not(os.path.isdir(f"Data/{self.simName}/r")) and self.np != None and self.np > 0:
-			os.mkdir(f"Data/{self.simName}/r")
-		if not(os.path.isdir(f"Data/{self.simName}/v")) and self.np != None and self.np > 0:
-			os.mkdir(f"Data/{self.simName}/v")
+		if not(os.path.isdir(self.dataDir + f"{self.simName}/r")) and self.np != None and self.np > 0:
+			os.mkdir(self.dataDir + f"{self.simName}/r")
+		if not(os.path.isdir(self.dataDir + f"{self.simName}/v")) and self.np != None and self.np > 0:
+			os.mkdir(self.dataDir + f"{self.simName}/v")
 		self.DataDrop(0)
 
 
@@ -506,8 +507,8 @@ class Solver():
 		if CUPY_IMPORTED and self.gpu:
 			np = cp
 		if self.np != None and self.np > 0:
-			np.save("Data/" + self.simName + f"/r/drop{i + self.initial_drop}.npy", self.r)
-			np.save("Data/" + self.simName + f"/v/drop{i + self.initial_drop}.npy", self.v)
+			np.save(self.dataDir + self.simName + f"/r/drop{i + self.initial_drop}.npy", self.r)
+			np.save(self.dataDir + self.simName + f"/v/drop{i + self.initial_drop}.npy", self.v)
 
 
 	def get_dt(self, T_remaining):
@@ -951,7 +952,7 @@ class Solver():
 				    r_vecs[r_vecs > self.L/2.] -= self.L
 				    r_vecs[r_vecs < -1*self.L/2.] += self.L
 
-				R = mu.Norm_L2(r_vecs, axes = (1)) + self.eps 
+				R = np.sqrt(mu.Norm_L2(r_vecs, axes = (1))**2 + self.eps**2 )
 				acc[i] = self.C*np.sum(mp_[:,np.newaxis]*r_vecs / R[:,np.newaxis]**3, axis = 0) / (4*np.pi)
 			
 			if self.D == 2:
@@ -959,7 +960,7 @@ class Solver():
 				if self.mod_positions:
 				    r_vecs[r_vecs > self.L/2.] -= self.L
 				    r_vecs[r_vecs < -1*self.L/2.] += self.L
-				R = mu.Norm_L2(r_vecs, axes = (1))  + self.eps
+				R = np.sqrt(mu.Norm_L2(r_vecs, axes = (1))**2 + self.eps**2 )
 				acc[i] = 2*self.C*np.sum(mp_[:,np.newaxis]*r_vecs / R[:,np.newaxis]**2, axis = 0) / (4*np.pi)
 			
 			if self.D == 1:
