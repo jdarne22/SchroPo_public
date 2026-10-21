@@ -1,8 +1,9 @@
 # pylint: disable=C,W
 # this test is designed to check that our distribution
 # is approximately stable under an external nfw potential
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+
+import tomllib
 
 import numpy as np_
 try:
@@ -15,43 +16,81 @@ import sys
 sys.path.insert(1, 'Solvers')
 import Solvers.mesh_solver_vect as MS
 import os
+import glob
+import re
 
 # test is ready to run
 # mestTest2 - control test
 # meshTest2b - use new update rule
+
+M_stars_str = '1e6'
+a_stars_str = '0.005'
 N = 256
-simName = f"haloTest_plummer_{N}"
+
+
+segue1 = True
+Dyn_fric = False
+
+if segue1:
+
+	simName = f"haloTest/Segue_1/haloTest_S1_{M_stars_str}_plummer_astars_{a_stars_str}_{N}"
+
+elif Dyn_fric:
+	simName = f"haloTest/Dyn_friction/5Kpc/haloTest_{M_stars_str}_plummer_a{a_stars_str}_{N}"
+
+else:
+	simName = f"haloTest/eri_II/haloTest_{M_stars_str}_plummer_{N}_2"
+
+M_stars = float(M_stars_str)
+print(f"total mass of stars: {M_stars:.3e} Msun")
+a_stars = float(a_stars_str) # scale radius of stars in kpc
+
+
+Checkpoint = True
+checkpoint_dir = f'/home/jdarne1/Eberhardt_Massive_Stars/SchroPo_public/Data/{simName}'
 data_drops = 5
 padded = True
+#CHANGED
 cf = .1
 nf = 1
 C = au.G*4*np.pi
 Tf = 1500.
 gpu = True
+
 fraction_FDM = .5
 
 
 meandens = 2.775e+11*0.7**2 * 0.31 * 1e-9 # mean density
-Rhalf = 0.3 # half light radius
-# dervived parameters
-### virial radius: using the relationship between the virial and half-light radius from https://arxiv.org/abs/1212.2980
-Rs = 2. # scale radius in kpc
-Rvir = Rhalf/0.015 
-# need to adjust the mass so its easier to sim?
-Mvir = (4*np.pi/3)*200*meandens*Rvir**3 # virial mass in solar masses
-con = Rvir / Rs # concentration parameter
 
 cp = np_
 if gpu:
 	cp = np
-L = Rvir*2 / np.sqrt(3) # box size in kpc
-m22 = cp.array([5.0])
-rho0 = Mvir/4/cp.pi/Rs**3 /(cp.log(1+con)-con/(1+con)) # scale density in solar masses / kpc^3
 
+if segue1:
+	toml_dir = os.path.join(os.getcwd(), f"../HaloConstructor_public/Data/Segue1_{N}_1e2m22_NFW")
+	with open(os.path.join(toml_dir, "params.toml"), "rb") as f:
+		data = tomllib.load(f)
 
-M_stars = 1e6
+	Rhalf = data["Rhalf"]
+	Rs = float(data["Rs"].split('(')[1].split(')')[0])
+	m22 = cp.array([data["m22"]])
+	rho0 = data["rho0"]
+	L = float(data["L"].split('(')[1].split(')')[0])
+	
+else:
+	Rhalf = 0.3 # half light radius
+	Rs = 2. # scale radius in kpc
+	m22 = cp.array([5.0])
 
-a_stars = 0.1 # scale radius of stars in kpc
+	Rvir = Rhalf/0.015 
+	# need to adjust the mass so its easier to sim?
+	Mvir = (4*np.pi/3)*200*meandens*Rvir**3 # virial mass in solar masses
+	print(f"virial mass of halo: {Mvir:.3e} Msun within {Rvir:.3e} kpc")
+	con = Rvir / Rs # concentration parameter
+	L = Rvir*2 / cp.sqrt(3) # box size in kpc
+
+	rho0 = Mvir/4/cp.pi/Rs**3 /(cp.log(1+con)-con/(1+con)) 
+
 
 def V_Plummer(R):
 	return -au.G*M_stars / cp.sqrt(R**2 + a_stars**2)
@@ -63,7 +102,6 @@ def M_Plummer(r):
 	return M_stars * r**3 / (r**2 + a_stars**2)**(3/2)
 
 
-
 def V_ext_func(R):
 	return au.V_NFW(R, Rs, rho0)*(1. - fraction_FDM) + V_Plummer(R)
 
@@ -71,11 +109,11 @@ def V_ext_func(R):
 def M_encl_func(r):
 	return au.M_NFW(r, Rs, rho0)*(1. - fraction_FDM) + M_Plummer(r)
 
-#def V_ext_func(R):
-	return au.V_NFW(R, Rs, rho0)*(1. - fraction_FDM)
-#
-#def M_encl_func(r):
-#	return au.M_NFW(r, Rs, rho0)*(1. - fraction_FDM)
+# def V_ext_func(R):
+# 	return au.V_NFW(R, Rs, rho0)*(1. - fraction_FDM)
+
+# def M_encl_func(r):
+# 	return au.M_NFW(r, Rs, rho0)*(1. - fraction_FDM)
 
 #central_dens_plummer = rho_Plummer(0.)
 #print(f"central density of plummer profile: {central_dens_plummer:.3e} Msun/kpc^3")
@@ -85,32 +123,79 @@ def M_encl_func(r):
 #print(f"virial mass of halo: {Mvir:.3e} Msun within {Rvir:.3e} kpc")
 
 
+def get_latest_drop(checkpoint_dir):
+
+	drops = {}
+
+	for path in glob.glob(os.path.join(checkpoint_dir, 'psi', 'drop*.npy')):
+		m = re.fullmatch(r'drop(\d+)\.npy', os.path.basename(path))
+		if m:
+			drops[int(m.group(1))] = path
+
+	for i in sorted(drops, reverse=True):
+		return i, drops[i]
+	return None
+
+
 def SetICs():
 	cp = np_
 	if gpu:
 		cp = np
 	s = MS.Solver()
+
+	initial_drop = 0
+	T_initial = 0.
+	Tf_run = Tf
+	drops_run = data_drops
+
+	found = get_latest_drop(checkpoint_dir) if Checkpoint else None
+
+	if found is not None:
+		initial_drop, psi_path = found
+		if initial_drop >= data_drops:
+			raise RuntimeError(f"checkpoint at drop {initial_drop}: sim already complete")
+		psi = cp.load(psi_path)
+		T_initial = Tf * initial_drop / data_drops
+		Tf_run = Tf - T_initial
+		drops_run = data_drops - initial_drop
+		print(f"resuming from drop {initial_drop} (T = {T_initial:.1f})")
+	else:
+		if Checkpoint:
+			print("no checkpoint found, generating new ICs")
+		psi = cp.zeros((nf,N,N,N)) + 0j
+
+		if segue1:
+			IC_dir = toml_dir
+			psi[0,:,:,:] = cp.load(os.path.join(IC_dir, f'psi.npy')) * cp.sqrt(fraction_FDM)
+
+		else:
+			IC_dir = os.path.join(os.getcwd(), "../HaloConstructor_public/Code")
+			psi[0,:,:,:] = cp.load(os.path.join(IC_dir, f'eri_200Emax_{N}_2.npy')) * cp.sqrt(fraction_FDM)
+
+
+	mass_tot = cp.sum(cp.abs(psi)**2) * (L/N)**3
+	print(f"total mass of FDM: {mass_tot:.3e} Msun")
+
 	### set simulation parameters
-	s.SetParams(simName=simName, N = N, data_drops = data_drops, padded=padded,
-	 cf=cf, L = L, m22 = m22, C = C, Tf = Tf, gpu = gpu)
+	s.SetParams(simName=simName, N = N, data_drops = drops_run, padded=padded,
+	 cf=cf, L = L, m22 = m22, C = C, Tf = Tf_run, gpu = gpu, a_stars = a_stars)
 	### set initial field
 	s.D = 3
 	s.M_encl_func = M_encl_func
 	s.V_ext_mesh_func = V_ext_func
 	s.M_encl_func_on = True
-	s.initial_drop = 0
-	s.T_initial = 0.
+	s.initial_drop = initial_drop
+	s.T_initial = T_initial
 
-	psi = cp.zeros((nf,N,N,N)) + 0j
+	s.interp_order = 3    # 1 NGP, 2 CIC (default), 3 TSC, 4 PCS
+	s.fd_order     = 6    # 2, 4 (default), 6, 8
 
-	IC_dir = os.path.join(os.getcwd(), "../HaloConstructor_public/Code")
-	psi[0,:,:,:] = cp.load(os.path.join(IC_dir, f'eri_200Emax_{N}.npy')) * cp.sqrt(fraction_FDM)
 
 	s.set_psi(psi)
-	
+
 	field_dens = s.GetFieldDensity()
 	central_soliton_dens = cp.max(field_dens)
-	#print(f"central soliton density: {central_soliton_dens:.3e} Msun/kpc^3")
+	print(f"central soliton density: {central_soliton_dens:.3e} Msun/kpc^3")
 
 	s.set_psi(psi)
 	s.set_K()
@@ -132,38 +217,4 @@ if __name__ == "__main__":
 	s.RunSim()
 	s.ShowDensity("final_density")
 
-	import matplotlib.pyplot as plt
-
-	to_cpu = lambda x: np_.asarray(x.get()) if hasattr(x, 'get') else np_.asarray(x)
-
-	r_grid   = to_cpu(s.R).ravel()              
-	rho_psi  = to_cpu(s.GetFieldDensity()).ravel()
-
-
-	r_min = float(r_grid.min())      # central pixel: sqrt(3)/2 * dx
-	r_max = float(to_cpu(L)) / 2.    # last radius with full spherical coverage
-	bins  = np_.logspace(np_.log10(r_min), np_.log10(r_max), 40)
-
-	which        = np_.digitize(r_grid, bins)
-	r_cent       = np_.sqrt(bins[:-1] * bins[1:])          
-	rho_psi_prof = np_.array([rho_psi[which == i].mean() if np_.any(which == i)
-							else np_.nan
-							for i in range(1, len(bins))])
-
-
-	r_fine = np_.logspace(np_.log10(0.02), np_.log10(r_max), 300)
-	rho_plum_fine = to_cpu(rho_Plummer(np_.asarray(r_fine)))
-
-	rho_plum = np_.array([rho_Plummer(r_cent[i]) for i in range(len(r_cent))])
-
-	plt.figure(figsize=(6, 5))
-	plt.loglog(r_cent, rho_psi_prof, "o-", label=r"$|\psi|^2$ (field)")
-	plt.loglog(r_cent, rho_plum,      "--", label="Plummer (stars)")
-	plt.axvline(a_stars, color="grey", ls=":", lw=1, label=r"$a_\star$")
-	plt.xlabel(r"$r$ [kpc]")
-	plt.ylabel(r"$\rho$ [$M_\odot\,\mathrm{kpc}^{-3}$]")
-	plt.legend()
-	plt.tight_layout()
-	plt.savefig(f"/home/joshua/PhD_year_1/Eberhardt_Massive_Stars/SchroPo_public/Data/haloTest_w_plummer/{simName}_density_profile.png", dpi=150)
-	plt.show()
-		
+	

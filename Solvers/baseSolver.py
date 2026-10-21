@@ -2,6 +2,7 @@
 import numpy as np_
 import os
 import time
+import itertools
 import mathUtils as mu
 import sysUtils as su
 import gridUtils as gu
@@ -14,6 +15,13 @@ try:
 	import cupy as cp 
 except ImportError:
 	CUPY_IMPORTED = False
+
+# particle-mesh assignment orders: cells per dimension.
+# 1 NGP, 2 CIC, 3 TSC, 4 PCS. the kernel W_p is the B-spline of degree p-1,
+# i.e. the top-hat convolved with itself p-1 times: each step widens the
+# support by one cell AND buys one more continuous derivative in the force.
+# NOTE 1 (NGP) does not conserve centre of mass -- diagnostic only.
+INTERP_ORDERS = (1, 2, 3, 4)
 
 class Solver():
 
@@ -57,6 +65,14 @@ class Solver():
 		self.cf = cf # float, courant factor
 		self.gpu = gpu # bool, run on gpu
 		self.explicit_particle_forces = False # use np^2 algorithm for particle forces
+		self.particle_particle_forces = True
+		self.interp_order = 2 # int, particle-mesh assignment order, cells per dim:
+							  # 1 NGP, 2 CIC (default, historic behaviour),
+							  # 3 TSC, 4 PCS. used for BOTH deposit and
+							  # interpolate -- matching kernels are what cancel
+							  # the self force, so this is deliberately one knob.
+		self.fd_order = 4 # int, central-difference order for grad(phi).
+						  # 4 is the historic 5-pt stencil. halo = fd_order/2.
 		self.eps = 0. # softening length
 		self.dt_max = 1.
 		self.make_periodic = True # should the walls of the box identify
@@ -96,7 +112,8 @@ class Solver():
 
 	def SetParams(self, simName = None, N = None, np = None, mp = None, data_drops = None,
 		padded = None, cf = None, L = None, dx = None, nf = None,
-		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = None, a_stars = None):
+		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = None, a_stars = None,
+		interp_order = None, fd_order = None):
 		"""
 		sets parameters
 
@@ -118,6 +135,8 @@ class Solver():
 		:dt: float, initial timestep
 		:gpu: bool, run on the gpu
 		:a_stars: float, Plummer scale length for stars
+		:interp_order: int, particle-mesh assignment order (1 NGP, 2 CIC, 3 TSC, 4 PCS)
+		:fd_order: int, central-difference order for grad(phi)
 		"""
 		if gpu != None:
 			self.set_gpu(gpu)
@@ -153,6 +172,10 @@ class Solver():
 			self.set_v(v)
 		if a_stars != None:
 			self.a_stars = a_stars
+		if interp_order != None:
+			self.set_interp_order(interp_order)
+		if fd_order != None:
+			self.set_fd_order(fd_order)
 
 		if N != None:
 			self.set_N_perif()
@@ -354,6 +377,40 @@ class Solver():
 		"""
 		self.gpu = gpu
 
+	def set_interp_order(self, interp_order):
+		"""
+		set the particle-mesh assignment order
+
+		:interp_order: int, cells per dimension, 1 NGP / 2 CIC / 3 TSC / 4 PCS
+		"""
+		if interp_order not in INTERP_ORDERS:
+			raise ValueError("interp_order must be one of %s (1 NGP, 2 CIC, "
+				"3 TSC, 4 PCS), got %r" % (sorted(INTERP_ORDERS), interp_order))
+		self.interp_order = interp_order
+
+	def set_fd_order(self, fd_order):
+		"""
+		set the central-difference order used for grad(phi)
+
+		:fd_order: int, order of accuracy, one of mathUtils.FD_COEFFS
+		"""
+		if fd_order not in mu.FD_COEFFS:
+			raise ValueError("fd_order must be one of %s, got %r"
+				% (sorted(mu.FD_COEFFS), fd_order))
+		self.fd_order = fd_order
+
+	def checkOrders(self):
+		"""
+		validates the interpolation / finite-difference orders. called at the
+		top of RunSim so a bad value set directly as an attribute (rather than
+		through the setter) still fails loudly, and before any compute.
+		"""
+		self.set_interp_order(self.interp_order)
+		self.set_fd_order(self.fd_order)
+		if self.N is not None and self.fd_order // 2 >= self.N // 2:
+			raise ValueError("fd_order %d needs a halo of %d cells, too wide "
+				"for N = %d" % (self.fd_order, self.fd_order // 2, self.N))
+
 	def ParticlesHaveMass(self):
 		np = np_
 		if CUPY_IMPORTED and self.gpu:
@@ -408,6 +465,8 @@ class Solver():
 		drops                       = {self.data_drops + self.initial_drop} # int, number of data drops
 		padded 						= {str(self.padded).lower()} # bool, pad density with 0s
 		c_f                         = {self.cf} # float, timestep courant factor
+		interp_order 				= {self.interp_order} # int, mesh assignment order: 1 NGP, 2 CIC, 3 TSC, 4 PCS
+		fd_order 					= {self.fd_order} # int, central-difference order for grad(phi)
 		'''
 
 		f = open(f"Data/{self.simName}/meta.toml", "w")
@@ -717,6 +776,7 @@ class Solver():
 		"""
 		run the simulation
 		"""
+		self.checkOrders()
 		self.InitializeFiles()
 		print("\nrunning simulation " + self.simName + "..." )
 		time0 = time.time()
@@ -853,7 +913,7 @@ class Solver():
 			elif self.D == 3:
 				acc = self.ComputeAcc3D(phi)
 
-		if self.explicit_particle_forces and self.ParticlesHaveMass():
+		if self.explicit_particle_forces and self.ParticlesHaveMass() and self.particle_particle_forces:
 			acc += self.ExplicitParticleForces()
 
 		if (len(self.M_encl) > 0 and len(self.r_ext) > 0) or self.M_encl_func_on:
@@ -912,6 +972,140 @@ class Solver():
 		return acc
 
 
+	def _bspline(self, p, s):
+		"""
+		private function, the B-spline mass-assignment kernel W_p: the top-hat
+		convolved with itself p-1 times. support |s| < p/2, degree p-1, and
+		C^(p-2) -- the force inherits exactly that smoothness as a particle drifts.
+
+		:p: int, assignment order (cells per dimension)
+		:s: array-like, signed distance from a cell centre, in cells
+
+		:return: array-like, weights
+		"""
+		np = np_
+		if CUPY_IMPORTED and self.gpu:
+			np = cp
+
+		s = np.abs(s)
+		if p == 1: # NGP
+			return np.where(s < .5, 1., 0.)
+		if p == 2: # CIC
+			return np.where(s < 1., 1. - s, 0.)
+		if p == 3: # TSC
+			return np.where(s < .5, .75 - s**2,
+				np.where(s < 1.5, .5*(1.5 - s)**2, 0.))
+		if p == 4: # PCS
+			return np.where(s < 1., 2./3. - s**2 + s**3/2.,
+				np.where(s < 2., (2. - s)**3/6., 0.))
+		raise ValueError("no assignment kernel for interp_order %r" % p)
+
+
+	def _assignment(self):
+		"""
+		private function, the particle-mesh assignment for self.interp_order.
+
+		cell centres sit at half-integer positions, so u = (r + L/2)/dx - .5 is
+		the particle measured in cell-centre units: integer u == sitting on a
+		centre. even orders straddle the gap between two centres, odd orders
+		centre on the nearest one.
+
+		:return: (i0, w), i0 [np, D] UNWRAPPED base cell index,
+			w [np, D, p] weights of cells i0 .. i0+p-1 along each axis
+		"""
+		np = np_
+		if CUPY_IMPORTED and self.gpu:
+			np = cp
+
+		p = self.interp_order
+		u = (self.r + self.L/2.) / self.dx - .5
+
+		if p % 2 == 0:
+			i0 = np.floor(u - p/2. + 1.).astype(int)
+		else:
+			i0 = (np.round(u) - (p - 1)//2).astype(int)
+
+		# weights come from the UNWRAPPED u: re-deriving the offset from a
+		# wrapped index would put the reference centre a whole box away.
+		w = np.zeros(u.shape + (p,))
+		for o in range(p):
+			w[..., o] = self._bspline(p, u - (i0 + o))
+
+		return i0, w
+
+
+	def _deposit(self):
+		"""
+		private function, deposit particle mass onto the mesh. touches p^D
+		cells per particle (8 for CIC, 27 for TSC, 64 for PCS).
+
+		:return: array-like, [N^D] density
+		"""
+		np = np_
+		if CUPY_IMPORTED and self.gpu:
+			np = cp
+
+		N = self.N
+		D = self.D
+		p = self.interp_order
+		len_ = N**D
+
+		mp = self.mp
+		if (isinstance(mp, float) or isinstance(mp, int)):
+			mp = np.ones(self.np)*self.mp
+
+		i0, w = self._assignment()
+		rho_r = np.zeros((len_))
+
+		for off in itertools.product(range(p), repeat = D):
+			wt = mp
+			ind_ = None
+			for d in range(D):
+				idx_d = (i0[:,d] + off[d]) % N
+				wt = wt*w[:,d,off[d]]
+				ind_ = idx_d if ind_ is None else ind_*N + idx_d
+			rho_r += np.bincount(ind_, weights = wt, minlength = len_)
+
+		return rho_r.reshape((N,)*D) / self.dx**D
+
+
+	def _interp_grad(self, phi):
+		"""
+		private function, interpolate -grad(phi) onto the particles using the
+		SAME kernel that deposits mass. matching kernels are what cancel the
+		self force, which is why interp_order is one knob and not two.
+
+		:phi: array-like, the potential
+
+		:return: array-like, [np, D] acceleration
+		"""
+		np = np_
+		if CUPY_IMPORTED and self.gpu:
+			np = cp
+
+		N = self.N
+		D = self.D
+		p = self.interp_order
+
+		i0, w = self._assignment()
+		acc = np.zeros(self.r.shape)
+
+		for ax in range(D):
+			gradPhi = mu.gradient_1D(phi, self.dx, ax, gpu = self.gpu,
+				padded = self.padded, order = self.fd_order)
+			tot = np.zeros(len(self.r))
+			for off in itertools.product(range(p), repeat = D):
+				wt = np.ones(len(self.r))
+				idx = []
+				for d in range(D):
+					idx.append((i0[:,d] + off[d]) % N)
+					wt = wt*w[:,d,off[d]]
+				tot += gradPhi[tuple(idx)]*wt
+			acc[:,ax] = -1*tot
+
+		return acc
+
+
 	def ComputeAcc3D(self, phi):
 		"""
 		compute the 3D acceleration for the corpuscular particles given a potential
@@ -920,90 +1114,8 @@ class Solver():
 
 		:return: array-like, [np, D] acceleration
 		"""
-		N = self.N
-		r = self.r
-		dx = self.dx
-		L = self.L
+		return self._interp_grad(phi)
 
-		np = np_
-		if CUPY_IMPORTED and self.gpu:
-			np = cp
-
-		acc = np.zeros(r.shape)
-		# cell centres sit at half-integer positions, so the centre to the
-		# particle's left is floor(u) with u shifted by .5 -- not floor((r+L/2)/dx),
-		# which gives the cell that *contains* the particle instead.
-		u = (r + L/2.) / dx - .5
-		ijk = np.floor(u).astype(int) # [n_particles, [i,j,k]]
-		# in-cell offset in [0,1), taken BEFORE the wrap: re-deriving it from a
-		# wrapped index would put the reference centre a whole box away.
-		t = u - ijk
-		ijk %= N
-
-		for i in range(self.D):
-			axis_ = i
-			gradPhi = mu.gradient_1D(phi, dx, axis_, gpu = self.gpu, padded= self.padded)
-
-			# i,j,k
-			f1 = 1 - t[:,0]
-			f2 = 1 - t[:,1]
-			f3 = 1 - t[:,2]
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
-
-			# i+1,j,k
-			f1 = 1. - f1 # dx
-			ijk[:,0] += 1
-			ijk[:,0] %= N
-
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
-
-			# i+1,j+1,k
-			f2 = 1. - f2 # tx
-			ijk[:,1] += 1
-			ijk[:,1] %= N
-
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
-
-			# i,j+1,k
-			f1 = 1. - f1
-			ijk[:,0] -= 1
-			ijk[:,0] %= N
-
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
-
-			# i,j+1,k+1
-			f3 = 1. - f3
-			ijk[:,2] += 1
-			ijk[:,2] %= N
-
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
-
-			# i,j,k+1
-			f2 = 1. - f2
-			ijk[:,1] -= 1
-			ijk[:,1] %= N
-
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
-
-			# i+1,j,k+1
-			f1 = 1. - f1
-			ijk[:,0] += 1
-			ijk[:,0] %= N
-
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
-
-			# i+1,j+1,k+1
-			f2 = 1. - f2
-			ijk[:,1] += 1
-			ijk[:,1] %= N
-
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1],ijk[:,2]]*f1*f2*f3
-
-			ijk[:,0] -= 1
-			ijk[:,1] -= 1
-			ijk[:,2] -= 1
-
-		return -1*acc
 
 	def ComputeAcc2D(self, phi):
 		"""
@@ -1013,54 +1125,7 @@ class Solver():
 
 		:return: array-like, [np, D] acceleration
 		"""
-		N = self.N
-		r = self.r
-		dx = self.dx
-		L = self.L
-
-		np = np_
-		if CUPY_IMPORTED and self.gpu:
-			np = cp
-
-		acc = np.zeros(r.shape)
-		# see ComputeAcc3D: anchor on the cell centre to the particle's left,
-		# and take the offset before wrapping the index
-		u = (r + L/2.) / dx - .5
-		ijk = np.floor(u).astype(int) # [n_particles, [i,j]]
-		t = u - ijk
-		ijk %= N
-
-		for i in range(self.D):
-			axis_ = i
-			gradPhi = mu.gradient_1D(phi, dx, axis_, gpu = self.gpu, padded=self.padded)
-
-			# i,j
-			f1 = 1 - t[:,0]
-			f2 = 1 - t[:,1]
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1]]*f1*f2
-
-			# i+1,j
-			f1 = 1. - f1 # dx
-			ijk[:,0] += 1
-			ijk[:,0] %= N
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1]]*f1*f2
-
-			# i+1,j+1
-			f2 = 1. - f2 # tx
-			ijk[:,1] += 1
-			ijk[:,1] %= N
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1]]*f1*f2
-
-			# i,j+1
-			f1 = 1. - f1
-			ijk[:,0] -= 1
-			ijk[:,0] %= N
-			acc[:,i] += gradPhi[ijk[:,0],ijk[:,1]]*f1*f2
-
-			ijk[:,0] -= 1
-			ijk[:,1] -= 1
-
-		return -1*acc
+		return self._interp_grad(phi)
 
 
 	def ComputeAcc1D(self, phi):
@@ -1071,37 +1136,7 @@ class Solver():
 
 		:return: array-like, [np, D] acceleration
 		"""
-		N = self.N
-		r = self.r
-		dx = self.dx
-		L = self.L
-
-		np = np_
-		if CUPY_IMPORTED and self.gpu:
-			np = cp
-
-		acc = np.zeros(r.shape)
-		# see ComputeAcc3D: anchor on the cell centre to the particle's left,
-		# and take the offset before wrapping the index
-		u = (r + L/2.) / dx - .5
-		ijk = np.floor(u).astype(int) # [n_particles, [i]]
-		t = u - ijk
-		ijk %= N
-
-		axis_ = 0
-		gradPhi = mu.gradient_1D(phi, dx, axis_, gpu = self.gpu, padded=self.padded)
-
-		# i
-		f1 = 1 - t[:]
-		acc[:] += gradPhi[ijk[:]]*f1
-
-		# i+1
-		f1 = 1. - f1 # dx
-		ijk[:] += 1
-		ijk[:] %= N
-		acc[:] += gradPhi[ijk[:]]*f1
-
-		return -1*acc
+		return self._interp_grad(phi)
 
 
 	def ComputeParticleDensity(self):
@@ -1124,94 +1159,7 @@ class Solver():
 
 		:return: array-like, [D^3] density
 		"""
-		N = self.N
-		r = self.r
-		dx = self.dx
-		L = self.L
-		len_ = N*N*N
-
-		np = np_
-		if CUPY_IMPORTED and self.gpu:
-			np = cp
-
-		mp = self.mp
-		if (isinstance(mp, float) or isinstance(mp,int)):
-			mp = np.ones(self.np)*self.mp
-
-		rho_r = np.zeros((len_))
-		# cell centres sit at half-integer positions, so the centre to the
-		# particle's left is floor(u) with u shifted by .5 -- not floor((r+L/2)/dx),
-		# which gives the cell that *contains* the particle instead.
-		u = (r + L/2.) / dx - .5
-		ijk = np.floor(u).astype(int) # [n_particles, [i,j,k]]
-		# in-cell offset in [0,1), taken BEFORE the wrap: re-deriving it from a
-		# wrapped index would put the reference centre a whole box away.
-		t = u - ijk
-		ijk %= N
-
-		# i,j,k
-		f1 = 1 - t[:,0]
-		f2 = 1 - t[:,1]
-		f3 = 1 - t[:,2]
-		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
-		rho_ = np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
-		# print(np.min(rho_), np.max(rho_))
-		rho_r += rho_
-
-		# i+1,j,k
-		f1 = 1. - f1 # dx
-		ijk[:,0] += 1
-		ijk[:,0] %= N
-		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
-		rho_ = np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
-		# print(np.min(rho_), np.max(rho_))
-		rho_r += rho_
-
-		# i+1,j+1,k
-		f2 = 1. - f2 # tx
-		ijk[:,1] += 1
-		ijk[:,1] %= N
-		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
-		rho_r += np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
-
-		# i,j+1,k
-		f1 = 1. - f1
-		ijk[:,0] -= 1
-		ijk[:,0] %= N
-		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
-		rho_r += np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
-
-		# i,j+1,k+1
-		f3 = 1. - f3
-		ijk[:,2] += 1
-		ijk[:,2] %= N
-		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
-		rho_r += np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
-
-		# i,j,k+1
-		f2 = 1. - f2
-		ijk[:,1] -= 1
-		ijk[:,1] %= N
-		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
-		rho_r += np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
-
-		# i+1,j,k+1
-		f1 = 1. - f1
-		ijk[:,0] += 1
-		ijk[:,0] %= N
-		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
-		rho_r += np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
-
-		# i+1,j+1,k+1
-		f2 = 1. - f2
-		ijk[:,1] += 1
-		ijk[:,1] %= N
-		ind_ = ijk[:,0]*N**2 + ijk[:,1]*N + ijk[:,2]
-		rho_r += np.bincount(ind_, weights = f1*f2*f3*mp, minlength = len_)
-
-		dV = dx**3 
-
-		return rho_r.reshape(N,N,N)/dV
+		return self._deposit()
 
 
 	def ComputeParticleDensity2D(self):
@@ -1220,58 +1168,7 @@ class Solver():
 
 		:return: array-like, [D^2] density
 		"""
-		N = self.N
-		r = self.r
-		dx = self.dx
-		L = self.L
-		len_ = N*N
-
-		np = np_
-		if CUPY_IMPORTED and self.gpu:
-			np = cp
-
-		mp = self.mp
-		if (isinstance(mp, float) or isinstance(mp,int)):
-			mp = np.ones(self.np)*self.mp
-
-		rho_r = np.zeros((len_))
-		# see ComputeParticleDensity3D: anchor on the cell centre to the
-		# particle's left, and take the offset before wrapping the index
-		u = (r + L/2.) / dx - .5
-		ijk = np.floor(u).astype(int) # [n_particles, [i,j]]
-		t = u - ijk
-		ijk %= N
-
-		# i,j
-		f1 = 1 - t[:,0]
-		f2 = 1 - t[:,1]
-		ind_ = ijk[:,0]*N + ijk[:,1]
-		rho_r += np.bincount(ind_, weights = f1*f2*mp, minlength = len_)
-
-		# i+1,j
-		f1 = 1. - f1 # dx
-		ijk[:,0] += 1
-		ijk[:,0] %= N
-		ind_ = ijk[:,0]*N + ijk[:,1]
-		rho_r += np.bincount(ind_, weights = f1*f2*mp, minlength = len_)
-
-		# i+1,j+1
-		f2 = 1. - f2 # tx
-		ijk[:,1] += 1
-		ijk[:,1] %= N
-		ind_ = ijk[:,0]*N + ijk[:,1]
-		rho_r += np.bincount(ind_, weights = f1*f2*mp, minlength = len_)
-
-		# i,j+1
-		f1 = 1. - f1
-		ijk[:,0] -= 1
-		ijk[:,0] %= N
-		ind_ = ijk[:,0]*N + ijk[:,1]
-		rho_r += np.bincount(ind_, weights = f1*f2*mp, minlength = len_)
-
-		dV = dx**2
-
-		return rho_r.reshape(N,N)/dV
+		return self._deposit()
 
 
 	def ComputeParticleDensity1D(self):
@@ -1280,43 +1177,7 @@ class Solver():
 
 		:return: array-like, [D] density
 		"""
-		N = self.N
-		r = self.r
-		dx = self.dx
-		L = self.L
-		len_ = N
-
-		np = np_
-		if CUPY_IMPORTED and self.gpu:
-			np = cp
-
-		mp = self.mp
-		if (isinstance(mp, float) or isinstance(mp,int)):
-			mp = np.ones(self.np)*self.mp
-
-		rho_r = np.zeros((len_))
-		# see ComputeParticleDensity3D: anchor on the cell centre to the
-		# particle's left, and take the offset before wrapping the index
-		u = (r + L/2.) / dx - .5
-		ijk = np.floor(u).astype(int) # [n_particles, [i]]
-		t = u - ijk
-		ijk %= N
-
-		# i
-		f1 = 1 - t[:]
-		ind_ = ijk[:]
-		rho_r += np.bincount(ind_, weights = f1*mp, minlength = len_)
-
-		# i+1
-		f1 = 1. - f1 # dx
-		ijk[:] += 1
-		ijk[:] %= N
-		ind_ = ijk[:]
-		rho_r += np.bincount(ind_, weights = f1*mp, minlength = len_)
-
-		dV = dx
-
-		return rho_r/dV
+		return self._deposit()
 
 
 	def showRadialDensity(self, name = 'density_profile'):

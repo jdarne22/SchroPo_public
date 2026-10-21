@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+log/
+Data/
+*.npy
+final_density.pdf
+frozen_final_density.pdf
+__pycache__/
+*.pyc
+log/
+Data/
+Broken/
+*.npy

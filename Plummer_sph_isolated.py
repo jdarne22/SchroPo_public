@@ -17,29 +17,31 @@ import os
 import glob
 import re
 import sys
+import matplotlib.pyplot as plt
 sys.path.insert(1, 'Solvers')
 import Solvers.mesh_solver_vect as MS
 
 # test is ready to run
 # mestTest2 - control test
 # meshTest2b - use new update rule
-simName = "plummer_isolated_256_run2"
+base_simName = "plummer_isolated_256_massive"
 Checkpoint = True
-checkpoint_dir = f'/home/jdarne1/Eberhardt_Massive_Stars/SchroPo_public/Data/{simName}'
 
 N = 256
-data_drops = 40
+data_drops = 20
 padded = True
-cf = .1 / 3.
+#CHANGED
+cf = .1
 nf = 1
 C = au.G*4*np.pi
 Tf = 1000.
 gpu = True
 fraction_FDM = 0. # zero FDM background for this test
-n_stars = int(3e4)
+#CHANGED
+n_stars = [int(1e4)]
 
 # Plummer sphere for the sampled stars — matches haloTest.py
-M_stars = 1e6   # total Plummer mass in solar masses
+M_stars = 3e6   # total Plummer mass in solar masses
 a_stars = 0.1   # Plummer scale radius in kpc
 
 meandens = 2.775e+11*0.7**2 * 0.31 * 1e-9 # mean density
@@ -55,13 +57,18 @@ con = Rvir / Rs # concentration parameter
 cp = np_
 if gpu:
 	cp = np
+
+def to_np(x):
+	# matplotlib can't implicitly convert cupy device arrays; pull to host explicitly
+	return x.get() if hasattr(x, 'get') else np_.asarray(x)
+
 L = Rvir*2 / cp.sqrt(3)
 R_initial_star = 2.
 m22 = cp.array([5.0])
 rho0 = Mvir/4/cp.pi/Rs**3 /(cp.log(1+con)-con/(1+con)) # scale density in solar masses / kpc^3
 
 
-def StarICs_Plummer():
+def StarICs_Plummer(n_stars, a_stars, M_stars):
 	cp = np_
 	if gpu:
 		cp = np
@@ -78,7 +85,7 @@ def StarICs_Plummer():
 	x = cp.sqrt(a**2 - z**2) * cp.cos(2*cp.pi*X3)
 	y = cp.sqrt(a**2 - z**2) * cp.sin(2*cp.pi*X3)
 
-	v_esc = cp.sqrt(2*au.G*M_stars / a_stars)*(1+a)**(-1/4)
+	v_esc = cp.sqrt(2*au.G*M_stars)*(a**2+a_stars**2)**(-1/4)
 
 	v = []
 
@@ -108,20 +115,36 @@ def StarICs_Plummer():
 	v_mag = cp.sqrt(cp.sum(v**2, axis = 1))
 
 	#Virial check
+	#CHANGED
 
-	# m_star = M_stars / n_stars
+	m_star = M_stars / n_stars
 
-	# W = -cp.sum(m_star * r_mag * au.G*M_stars * r_mag / (r_mag**2 + a_stars**2)**(3/2))
+	W = -cp.sum(m_star * r_mag * au.G*M_stars * r_mag / (r_mag**2 + a_stars**2)**(3/2))
 
-	# KE = 0.5 * cp.sum(m_star * v_mag**2)
+	KE = 0.5 * cp.sum(m_star * v_mag**2)
 
-	# scale_factor = cp.sqrt(cp.abs(W)/(2*KE))
+	scale_factor = cp.sqrt(cp.abs(W)/(2*KE))
 
-	# v_mag *= scale_factor
-	# v *= scale_factor
+	v_mag *= scale_factor
+	v *= scale_factor
 
 
 	return r, v
+
+def Plummer_sph_v_dist_analytic(a_stars, M_stars):
+
+	r = cp.linspace(0, 5*a_stars, 1000)
+
+	v_esc = lambda r: cp.sqrt(2*au.G*M_stars)*(r**2+a_stars**2)**(-1/4)
+
+	vel_dist = lambda v, v_esc: 512/(7*np.pi) * v**2/v_esc**3 * (1 - v**2/v_esc**2)**(7/2)
+
+	return vel_dist, v_esc
+
+def Interpart_spacing(a_stars, M_stars, n_stars):
+	rho_center = 3*M_stars/(4*np.pi*a_stars**3)
+	central_spacing = (M_stars/n_stars/rho_center)**(1/3)
+	return central_spacing
 
 
 def get_latest_drop(checkpoint_dir):
@@ -142,7 +165,7 @@ def get_latest_drop(checkpoint_dir):
 	return None
 
 
-def SetICs():
+def SetICs(n_stars, a_stars, M_stars):
 	cp = np_
 	if gpu:
 		cp = np
@@ -167,7 +190,8 @@ def SetICs():
 	else:
 		if Checkpoint:
 			print("no checkpoint found, generating new ICs")
-		r,v = StarICs_Plummer()
+		r,v = StarICs_Plummer(n_stars, a_stars, M_stars)
+	
 
 	mp = cp.ones(n_stars)*M_stars / n_stars
 
@@ -175,14 +199,21 @@ def SetICs():
 	### set simulation parameters
 	s.SetParams(simName=simName, N = N, data_drops = drops_run, padded=padded,
 	 cf=cf, L = L, m22 = m22, C = C, Tf = Tf_run, r = r, v = v,
-	 np = n_stars, mp = mp, gpu = gpu)
+	 np = n_stars, mp = mp, gpu = gpu, a_stars = a_stars)
 	### set initial field
 	s.D = 3
 	# no s.M_encl_func / s.M_encl_func_on: zero external NFW potential
 	s.explicit_particle_forces = True
-	s.eps = 1e-5 / 3.
+	#CHANGED was 1e-5 now 1e-5/3 but now 1e-9
+	s.eps = Interpart_spacing(a_stars, M_stars, n_stars)
+	print(f"interparticle spacing = {s.eps:.5f}")
 	s.initial_drop = initial_drop
 	s.T_initial = T_initial
+
+	s.interp_order = 3    # 1 NGP, 2 CIC (default), 3 TSC, 4 PCS
+	s.fd_order     = 6    # 2, 4 (default), 6, 8
+
+
 
 	# zero FDM field: psi stays all-zero and frozen for the whole run
 	psi = cp.zeros((nf,N,N,N)) + 0j
@@ -197,14 +228,58 @@ def SetICs():
 
 if __name__ == "__main__":
 	# set up sim ics
-	s = SetICs()
 
-	# s.ShowDensity("initial_density")
-	# s.Update(10.)
-	# s.ShowDensity()
-	# assert(0)
+	for n_stars in n_stars:
+		print(f"Running simulation with {n_stars} stars")
 
-	# - run sim
-	s.RunSim()
-	s.ShowDensity("frozen_final_density")
-	
+		# each run gets its own subfolder inside the base folder, with n_stars
+		# appended to the name
+		simName = f'Isolated_Plummer/{base_simName}/{base_simName}_{n_stars}'
+		checkpoint_dir = f'/home/jdarne1/Eberhardt_Massive_Stars/SchroPo_public/Data/{simName}'
+		os.makedirs(checkpoint_dir, exist_ok=True)
+
+		s = SetICs(n_stars, a_stars, M_stars)
+
+		vel_dist, v_esc = Plummer_sph_v_dist_analytic(a_stars, M_stars)
+
+		v = s.v
+		r = s.r
+
+		v_mag = cp.sqrt(cp.sum(v**2, axis = 1))
+		r_mag = cp.sqrt(cp.sum(r**2, axis = 1))
+
+		a_tests = [0.3*a_stars, 0.5*a_stars, a_stars, 2*a_stars, 3*a_stars, 4*a_stars]
+
+		masks = [cp.abs(r_mag - a) < 0.01*a for a in a_tests]
+
+		fig, ax = plt.subplots(6, 1, figsize = (10, 13))
+
+		for i in range(len(a_tests)):
+			a = a_tests[i]
+			mask = masks[i]
+			masked_v_mag = v_mag[mask]
+			v_grid = cp.linspace(0, v_esc(a), 1000)
+			vel_dist_at_a = vel_dist(v_grid, v_esc(a))
+			ax[i].plot(to_np(v_grid), to_np(vel_dist_at_a), label=f'Analytic Distribution', color='orange')
+			ax[i].hist(to_np(masked_v_mag), bins=30, density=True, alpha=0.5, label=f'Sampled Velocities', color='blue')
+			ax[i].axvline(to_np(v_esc(a)), color='r', linestyle='--', label=f'v_esc = {v_esc(a):.2f} kpc/Gyr')
+			ax[i].set_xlabel('Velocity')
+			ax[i].set_ylabel('Velocity Distribution')
+			ax[i].legend()
+			ax[i].set_title(f'Velocity Distribution at r = {a:.2f} kpc')
+
+
+
+
+		# s.ShowDensity("initial_density")
+		# s.Update(10.)
+		# s.ShowDensity()
+		# assert(0)
+
+		# - run sim
+		s.RunSim()
+		#s.ShowDensity("frozen_final_density")
+		
+		plt.tight_layout()
+		plt.savefig(f'{checkpoint_dir}/vel_dist_with_virial.png')
+		plt.close()

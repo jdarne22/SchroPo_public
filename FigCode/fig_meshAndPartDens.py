@@ -6,7 +6,7 @@ import mathUtils as mu
 import matplotlib.pyplot as plt 
 import numpy as np 
 
-simName = 'physTest1a'
+simName = 'starTest/Segue_1/starTest_S1_1e6_plummer_astars_0.005_256'
 
 
 def PlotStuff(d):
@@ -15,6 +15,7 @@ def PlotStuff(d):
 	initial_drop = 0 
 	second_drop = 1
 	mid_drop = d.data_drops // 2
+	third_drop = d.data_drops * 2 // 3
 	final_drop = d.data_drops 
 
 	N = d.N
@@ -28,32 +29,40 @@ def PlotStuff(d):
 
 	psi = d.LoadPsi(initial_drop)
 	slice_ = d.GetFieldDensity()[N//2,:,:]
-	fo.AddDens2d(x, np.log(slice_) )
+	fo.AddDens2d(x, np.log10(slice_) )
 	T_i = T * float(initial_drop) / data_drops
 	fo.AddText(r'$%i \, [\mathrm{Myr}]$'%(T_i))
 	fo.RemoveXLabels()
 
-	psi = d.LoadPsi(second_drop)
-	slice_ = d.GetFieldDensity()[N//2,:,:]
-	fo.AddDens2d(x, np.log(slice_) )
-	T_s = T * float(second_drop) / data_drops
-	fo.AddText(r'$%i \, [\mathrm{Myr}]$'%(T_s))
-	fo.RemoveXLabels()
-	fo.RemoveYLabels()	
+	# psi = d.LoadPsi(second_drop)
+	# slice_ = d.GetFieldDensity()[N//2,:,:]
+	# fo.AddDens2d(x, np.log10(slice_) )
+	# T_s = T * float(second_drop) / data_drops
+	# fo.AddText(r'$%i \, [\mathrm{Myr}]$'%(T_s))
+	# fo.RemoveXLabels()
+	# fo.RemoveYLabels()	
 
 
 
 	psi = d.LoadPsi(mid_drop)
 	slice_ = d.GetFieldDensity()[N//2,:,:]
-	fo.AddDens2d(x, np.log(slice_) )
+	fo.AddDens2d(x, np.log10(slice_) )
 	T_m = T * float(mid_drop) / data_drops
 	fo.AddText(r'$%i \, [\mathrm{Myr}]$'%(T_m))
 	fo.RemoveXLabels()
 	fo.RemoveYLabels()	
 
+	psi = d.LoadPsi(third_drop)
+	slice_ = d.GetFieldDensity()[N//2,:,:]
+	fo.AddDens2d(x, np.log10(slice_) )
+	T_t = T * float(third_drop) / data_drops
+	fo.AddText(r'$%i \, [\mathrm{Myr}]$'%(T_t))
+	fo.RemoveXLabels()
+	fo.RemoveYLabels()	
+
 	psi = d.LoadPsi(final_drop)
 	slice_ = d.GetFieldDensity()[N//2,:,:]
-	fo.AddDens2d(x, np.log(slice_) )
+	fo.AddDens2d(x, np.log10(slice_) )
 	T_f = T * float(final_drop) / data_drops
 	fo.AddText(r'$%i \, [\mathrm{Myr}]$'%(T_f))
 	fo.RemoveXLabels()
@@ -65,22 +74,22 @@ def PlotStuff(d):
 	proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
 	rX = r[:,2]
 	rY = r[:,1]
-	fo.AddDens2d(x, np.log(proj))
-	fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 0.01, color = 'r')
+	fo.AddDens2d(x, np.log10(proj))
+	fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 1, color = 'r')
 	fo.SetXLim(-L/2, L/2)
 	fo.SetYLim(-L/2, L/2)
 
-	r,v,psi = d.LoadData(second_drop,center = False)
-	print(np.mean(r, axis = 0))
-	proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
-	rX = r[:,2]
-	rY = r[:,1]
-	proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
-	fo.AddDens2d(x, np.log(proj))
-	fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 0.01, color = 'r')
-	fo.SetXLim(-L/2, L/2)
-	fo.SetYLim(-L/2, L/2)
-	fo.RemoveYLabels()
+	# r,v,psi = d.LoadData(second_drop,center = False)
+	# print(np.mean(r, axis = 0))
+	# proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
+	# rX = r[:,2]
+	# rY = r[:,1]
+	# proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
+	# fo.AddDens2d(x, np.log10(proj))
+	# fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 0.01, color = 'r')
+	# fo.SetXLim(-L/2, L/2)
+	# fo.SetYLim(-L/2, L/2)
+	# fo.RemoveYLabels()
 
 	r,v,psi = d.LoadData(mid_drop,center = False)
 	print(np.mean(r, axis = 0))
@@ -88,8 +97,20 @@ def PlotStuff(d):
 	rX = r[:,2]
 	rY = r[:,1]
 	proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
-	fo.AddDens2d(x, np.log(proj))
-	fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 0.01, color = 'r')
+	fo.AddDens2d(x, np.log10(proj))
+	fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 1, color = 'r')
+	fo.SetXLim(-L/2, L/2)
+	fo.SetYLim(-L/2, L/2)
+	fo.RemoveYLabels()
+
+	r,v,psi = d.LoadData(third_drop,center = False)
+	print(np.mean(r, axis = 0))
+	proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
+	rX = r[:,2]
+	rY = r[:,1]
+	proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
+	fo.AddDens2d(x, np.log10(proj))
+	fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 1, color = 'r')
 	fo.SetXLim(-L/2, L/2)
 	fo.SetYLim(-L/2, L/2)
 	fo.RemoveYLabels()
@@ -101,8 +122,8 @@ def PlotStuff(d):
 	rX = r[:,2]
 	rY = r[:,1]
 	proj = np.sum( d.GetFieldDensity() , axis = 0)*dx
-	fo.AddDens2d(x, np.log(proj))
-	fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 0.01, color = 'r')
+	fo.AddDens2d(x, np.log10(proj))
+	fo.AddLine(rX, rY, ls = ' ', mk = '.', alpha = 1, color = 'r')
 	fo.SetXLim(-L/2, L/2)
 	fo.SetYLim(-L/2, L/2)
 	fo.RemoveYLabels()

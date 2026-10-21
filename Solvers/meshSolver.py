@@ -5,6 +5,7 @@ import time
 import sysUtils as su
 import mathUtils as mu
 import plotUtils as pu
+import gridUtils as gu
 import types
 import baseSolver as BS
 CUPY_IMPORTED = True
@@ -20,7 +21,7 @@ class Solver(BS.Solver):
 	def __init__(self, simName = None, N = None, np = 0, data_drops = None, padded = False,
 		cf = None, L = None, dx = None, nf = None, m22 = [], hbar_ = [], 
 		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = False, 
-		psi = [], K = [], mp = None):
+		psi = [], K = [], mp = None, a_stars = None):
 		"""
 		initialize solver object
 
@@ -51,7 +52,7 @@ class Solver(BS.Solver):
 		"""
 		super().__init__(simName = simName, N = N, np = np, data_drops = data_drops,
 		padded = padded, cf = cf, L = L, dx = dx, nf = nf, D = D, C = C, Tf = Tf,
-		r = r, v = v, dt = dt, mp = mp)
+		r = r, v = v, dt = dt, mp = mp, a_stars = a_stars)
 
 		### simulation parameters
 		self.oldUpdateRule = True
@@ -84,9 +85,9 @@ class Solver(BS.Solver):
 
 
 	def SetParams(self, simName = None, N = None, np = None, mp = None, data_drops = None, padded = None,
-		cf = None, L = None, dx = None, nf = None, m22 = [], hbar_ = [], 
-		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = None, 
-		psi = [], K = []):
+		cf = None, L = None, dx = None, nf = None, m22 = [], hbar_ = [],
+		D = None, C = None, Tf = None, r = [], v = [], dt = None, gpu = None,
+		psi = [], K = [], a_stars = None, interp_order = None, fd_order = None):
 		"""
 		sets parameters
 
@@ -112,10 +113,14 @@ class Solver(BS.Solver):
 		:psi: array-like, [nf,N^D] spatial field
 		:K: array-like, [N^3] kinetic update operator argument, \n
 			i.e. e^{-1j*hbar_*K*dt} is the op
+		:a_stars: float, Plummer scale length for stars
+		:interp_order: int, particle-mesh assignment order (1 NGP, 2 CIC, 3 TSC, 4 PCS)
+		:fd_order: int, central-difference order for grad(phi)
 		"""
 		super().SetParams(simName = simName, N = N, np = np, data_drops = data_drops,
 		padded = padded, cf = cf, L = L, dx = dx, nf = nf, mp = mp,
-		D = D, C = C, Tf = Tf, r = r, v = v, dt = dt, gpu = gpu)
+		D = D, C = C, Tf = Tf, r = r, v = v, dt = dt, gpu = gpu, a_stars = a_stars,
+		interp_order = interp_order, fd_order = fd_order)
 
 		if not(N is None):
 			self.set_N(N)
@@ -153,6 +158,7 @@ class Solver(BS.Solver):
 		"""
 		super().set_N_perif()
 		self.set_K()
+		self.set_R()
 
 	def set_L(self, L):
 		"""
@@ -168,6 +174,15 @@ class Solver(BS.Solver):
 		"""
 		super().set_L_perif()
 		self.set_K()
+		self.set_R()
+
+	def set_R(self):
+		"""
+		private function, sets the radial position each cell is defined at \n
+		default: use N and L to figure R out
+		"""
+		if self.N != None and self.L != None:
+			self.R, _, _ = gu.sphrGrid(self.N, self.L, gpu = self.gpu)
 
 	def set_psi(self, psi):
 		"""
@@ -331,6 +346,8 @@ class Solver(BS.Solver):
 		drops                       = {self.data_drops+ self.initial_drop} # int, number of data drops
 		padded 						= {padded_} # bool, pad density with 0s
 		c_f                         = {self.cf} # float, timestep courant factor
+		interp_order 				= {self.interp_order} # int, mesh assignment order: 1 NGP, 2 CIC, 3 TSC, 4 PCS
+		fd_order 					= {self.fd_order} # int, central-difference order for grad(phi)
 		'''
 
 		f = open(f"Data/{self.simName}/meta.toml", "w")
@@ -362,6 +379,7 @@ class Solver(BS.Solver):
 		return self.V_ext_mesh_func(self.R)
 
 
+#If explicit false, include particles true
 
 	def compute_phi(self, include_particles = True, include_external = True):
 		"""
@@ -608,9 +626,13 @@ class Solver(BS.Solver):
 		np = np_
 		if CUPY_IMPORTED and self.gpu:
 			np = cp
-		Vmax = np.abs(mu.gradient_1D(phi, self.dx, axis_ = 0, gpu = self.gpu)[2:self.N-2,2:self.N-2,2:self.N-2])**2
-		Vmax += np.abs(mu.gradient_1D(phi, self.dx, axis_ = 1, gpu = self.gpu)[2:self.N-2,2:self.N-2,2:self.N-2])**2
-		Vmax += np.abs(mu.gradient_1D(phi, self.dx, axis_ = 2, gpu = self.gpu)[2:self.N-2,2:self.N-2,2:self.N-2])**2
+		# trim the stencil halo. an order-2m stencil reaches m cells, so those
+		# are the ones roll() corrupted; m was hardcoded as 2 for the 5-pt case.
+		m = self.fd_order // 2
+		core = (slice(m, self.N - m),)*3
+		Vmax = np.abs(mu.gradient_1D(phi, self.dx, axis_ = 0, gpu = self.gpu, order = self.fd_order)[core])**2
+		Vmax += np.abs(mu.gradient_1D(phi, self.dx, axis_ = 1, gpu = self.gpu, order = self.fd_order)[core])**2
+		Vmax += np.abs(mu.gradient_1D(phi, self.dx, axis_ = 2, gpu = self.gpu, order = self.fd_order)[core])**2
 		Vmax = np.sqrt(np.max(Vmax))*self.dx
 
 		return Vmax
@@ -652,6 +674,7 @@ class Solver(BS.Solver):
 		run the simulation
 		"""
 		self.checkPotentialConsistent()
+		self.checkOrders()
 		self.InitializeFiles()
 		print("\nrunning simulation " + self.simName + "..." )
 		time0 = time.time()
@@ -720,6 +743,7 @@ class Solver(BS.Solver):
 			rho_slice, Sigma = su.gpu2cpu(rho_slice, Sigma)
 
 			fo = pu.FigObj(2)
+			L = float(L)
 			fo.AddDens2d(np_.array([L/-2.,L/2]),np_.log(Sigma) )
 			fo.SetTitle("density projection")
 			fo.AddDens2d([L/-2.,L/2],np_.log(rho_slice))
